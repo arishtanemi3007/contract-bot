@@ -1,0 +1,12 @@
+# Python environments and cache
+venv/
+__pycache__/
+
+# Databases
+contracts.db
+
+# Temporary files
+temp_images/
+
+# Security
+.env
