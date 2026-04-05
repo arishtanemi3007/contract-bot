@@ -33,8 +33,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     welcome_msg = (
-        "👋 Welcome to the AVIVO Contract Intelligence Bot!\n"
-        "Avivo Legal में आपका स्वागत है।\n\n"
+        "👋 Welcome to the Contract Buddy!\n"
+        "Contract Buddy में आपका स्वागत है।\n\n"
         "Please select your preferred language / कृपया अपनी भाषा चुनें:"
     )
     await update.message.reply_text(welcome_msg, reply_markup=reply_markup)

@@ -1,4 +1,4 @@
-# ⚖️ Avivo Contract Intelligence Bot
+# ⚖️ Contract Buddy
 
 An asynchronous, multimodal, and fully localized AI legal assistant deployed via Telegram. Designed with privacy and performance in mind, this project demonstrates advanced Agentic AI architecture, combining Retrieval-Augmented Generation (RAG) with local multimodal vision models to analyze, query, and summarize legal contracts. 
 
