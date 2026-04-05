@@ -1,27 +1,57 @@
 import os
 import re
 import time
-import base64
 import sqlite3
 import sqlite_vec
 import struct
+import easyocr
+from langdetect import detect
 from sentence_transformers import SentenceTransformer
 from langchain_text_splitters import MarkdownTextSplitter
-from langchain_ollama import OllamaLLM, ChatOllama
+from langchain_ollama import OllamaLLM
 from langchain_core.prompts import PromptTemplate
-from langchain_core.messages import HumanMessage
 
-# 1. Initialize the embedding model
-print("Loading embedding model (this may take a moment the first time)...")
+# ---------------------------------------------------------
+# 1. INITIALIZATION & GLOBALS
+# ---------------------------------------------------------
+print("Booting local embedding model...")
 embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+
+print("Booting local LLMs...")
+deepseek_llm = OllamaLLM(model="deepseek-r1:8b")
+# Initialize Sarvam for Indic translations
+sarvam_llm = OllamaLLM(model="mashriram/sarvam-1", temperature=0.1)
+
+print("Loading EasyOCR Vision Models (English, Hindi, Marathi)...")
+reader = easyocr.Reader(['en', 'hi', 'mr'])
 
 DB_PATH = "contracts.db"
 DATA_DIR = "data"
 
 # --- MEMORY BUFFER ---
-# Stores conversation history keyed by Telegram chat_id
 chat_histories = {}
-MAX_HISTORY = 4 # Keep the last 4 interactions to save VRAM
+MAX_HISTORY = 4
+
+LANGUAGE_MAP = {
+    'hi': 'Hindi', 'mr': 'Marathi', 'gu': 'Gujarati',
+    'kn': 'Kannada', 'ta': 'Tamil', 'te': 'Telugu'
+}
+
+# ---------------------------------------------------------
+# 2. HELPER FUNCTIONS
+# ---------------------------------------------------------
+def translate_with_sarvam(text, target_language="English"):
+    """Uses Sarvam-1 for strict, zero-hallucination legal translation."""
+    prompt = f"""You are a highly accurate legal translator.
+    Translate the following text into {target_language}.
+    Do not summarize, do not add commentary. Just provide the exact translation.
+
+    TEXT:
+    {text}
+
+    TRANSLATION:"""
+    raw_response = sarvam_llm.invoke(prompt)
+    return raw_response.strip()
 
 def init_db():
     """Initializes the SQLite database with the sqlite-vec extension."""
@@ -50,6 +80,9 @@ def serialize_f32(vector):
     """Converts a list of floats into the raw bytes required by sqlite-vec."""
     return struct.pack(f"{len(vector)}f", *vector)
 
+# ---------------------------------------------------------
+# 3. CORE DB OPERATIONS
+# ---------------------------------------------------------
 def ingest_documents():
     """Reads Markdown files, chunks them, and stores embeddings in the DB."""
     conn = init_db()
@@ -94,8 +127,6 @@ def retrieve_chunks(query, top_k=3):
     query_embedding = embedding_model.encode(query).tolist()
     
     cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM contract_chunks")
-    
     cursor.execute('''
         SELECT 
             contract_chunks.document_name, 
@@ -110,10 +141,21 @@ def retrieve_chunks(query, top_k=3):
     conn.close()
     return results
 
-def answer_query(query, chat_id="default"):
-    """Retrieves context, injects memory, and generates an answer."""
-    retrieved_docs = retrieve_chunks(query)
-    print(f"[DEBUG] Successfully retrieved {len(retrieved_docs)} relevant chunks for the prompt.")
+# ---------------------------------------------------------
+# 4. BOT PIPELINE FUNCTIONS
+# ---------------------------------------------------------
+def answer_query(query, chat_id="default", user_lang="en"):
+    """Retrieves context, injects memory, and translates if necessary."""
+    
+    # 1. Translate incoming Indic query to English for the DeepSeek brain
+    if user_lang != 'en':
+        print(f"🔄 Translating query from {user_lang} to English...")
+        english_query = translate_with_sarvam(query, "English")
+    else:
+        english_query = query
+
+    retrieved_docs = retrieve_chunks(english_query)
+    print(f"[DEBUG] Successfully retrieved {len(retrieved_docs)} relevant chunks.")
     
     if not retrieved_docs:
         return "I couldn't find any relevant information in the uploaded contracts."
@@ -126,15 +168,13 @@ def answer_query(query, chat_id="default"):
         
     context_string = "\n".join(context_parts)
     
-    # 1. Format the Chat History
+    # Format Chat History
     history = chat_histories.get(chat_id, [])
     history_string = ""
     if history:
         history_string = "Previous Conversation Context:\n"
         for msg in history:
             history_string += f"{msg['role'].capitalize()}: {msg['content']}\n"
-    
-    llm = OllamaLLM(model="deepseek-r1:8b")
     
     prompt_template = PromptTemplate(
         input_variables=["chat_history", "context", "query"],
@@ -150,30 +190,87 @@ def answer_query(query, chat_id="default"):
         )
     )
     
-    prompt = prompt_template.format(chat_history=history_string, context=context_string, query=query)
-    print(f"🧠 Thinking... (Querying deepseek-r1:8b with memory)")
+    prompt = prompt_template.format(chat_history=history_string, context=context_string, query=english_query)
+    print("🧠 Thinking... (Querying deepseek-r1:8b with memory)")
     
-    raw_response = llm.invoke(prompt)
-    clean_response = re.sub(r'<think>.*?</think>', '', raw_response, flags=re.DOTALL).strip()
+    raw_response = deepseek_llm.invoke(prompt)
+    clean_english_response = re.sub(r'<think>.*?</think>', '', raw_response, flags=re.DOTALL).strip()
     
-    # 2. Save the new interaction to Memory
+    # Save English logic to memory to prevent cross-language confusion in future turns
     if chat_id not in chat_histories:
         chat_histories[chat_id] = []
-    chat_histories[chat_id].append({"role": "user", "content": query})
-    chat_histories[chat_id].append({"role": "assistant", "content": clean_response})
+    chat_histories[chat_id].append({"role": "user", "content": english_query})
+    chat_histories[chat_id].append({"role": "assistant", "content": clean_english_response})
     
-    # 3. Prune old memory so we don't crash the GPU
     if len(chat_histories[chat_id]) > MAX_HISTORY * 2:
         chat_histories[chat_id] = chat_histories[chat_id][-MAX_HISTORY * 2:]
         
-    return clean_response
+    # 2. Translate English answer back to the user's selected language
+    if user_lang != 'en':
+        target_lang = LANGUAGE_MAP.get(user_lang, 'English')
+        print(f"🔄 Translating final answer back to {target_lang}...")
+        return translate_with_sarvam(clean_english_response, target_lang)
 
-def summarize_conversation(chat_id="default"):
-    """Reads the user's memory buffer and generates an executive summary."""
+    return clean_english_response
+
+def analyze_contract_image(image_path, user_lang="en"):
+    """Extracts text via OCR, normalizes to English, analyzes, and translates back."""
+    print("🖼️ Running EasyOCR extraction...")
+    
+    results = reader.readtext(image_path, detail=0)
+    extracted_text = " ".join(results)
+    
+    if len(extracted_text.strip()) < 10:
+        return "❌ Could not extract enough text from this image. Please ensure the photo is clear and well-lit."
+
+    try:
+        doc_lang = detect(extracted_text[:500])
+        print(f"🌐 Document Language Detected: {doc_lang}")
+    except:
+        doc_lang = 'en'
+        
+    indic_langs = ['hi', 'mr', 'gu', 'kn', 'ta', 'te', 'bn', 'ml', 'or', 'pa']
+    
+    # Normalize to English for DeepSeek
+    if doc_lang in indic_langs:
+        print("🔄 Translating document to English via Sarvam-1...")
+        english_contract = translate_with_sarvam(extracted_text, "English")
+    else:
+        english_contract = extracted_text
+
+    # DeepSeek Risk Analysis
+    print("🧠 DeepSeek-R1 analyzing contract liabilities...")
+    analysis_prompt = f"""You are an expert AI legal paralegal.
+    Review the following contract text extracted from an image.
+    Identify any major liabilities, unusual clauses, or risks.
+    Format your response with clear headings and bullet points.
+
+    CONTRACT TEXT:
+    {english_contract}
+
+    RISK ANALYSIS:"""
+    
+    raw_response = deepseek_llm.invoke(analysis_prompt)
+    clean_english_analysis = re.sub(r'<think>.*?</think>', '', raw_response, flags=re.DOTALL).strip()
+
+    # Translate back to the user's preferred language if necessary
+    if user_lang != 'en':
+        target_lang = LANGUAGE_MAP.get(user_lang, 'English')
+        print(f"🔄 Translating analysis back to {target_lang}...")
+        return translate_with_sarvam(clean_english_analysis, target_lang)
+
+    return clean_english_analysis
+
+def summarize_conversation(chat_id="default", user_lang="en"):
+    """Reads the user's memory buffer, generates a summary, and translates it."""
     history = chat_histories.get(chat_id, [])
     
     if not history:
-        return "We haven't discussed anything yet! Use /ask to query your contracts first."
+        error_msg = "We haven't discussed anything yet! Use /ask to query your contracts first."
+        if user_lang != 'en':
+             target_lang = LANGUAGE_MAP.get(user_lang, 'English')
+             return translate_with_sarvam(error_msg, target_lang)
+        return error_msg
         
     history_string = ""
     for msg in history:
@@ -186,49 +283,17 @@ def summarize_conversation(chat_id="default"):
         "Executive Summary:"
     )
     
-    llm = OllamaLLM(model="deepseek-r1:8b")
     print("📝 Generating Session Summary...")
-    raw_response = llm.invoke(prompt)
-    clean_response = re.sub(r'<think>.*?</think>', '', raw_response, flags=re.DOTALL).strip()
+    raw_response = deepseek_llm.invoke(prompt)
+    clean_english_response = re.sub(r'<think>.*?</think>', '', raw_response, flags=re.DOTALL).strip()
     
-    return clean_response
-
-def analyze_contract_image(image_path):
-    {
-                "type": "text", 
-                "text": (
-                    "You are an expert legal assistant. Read the text in this image. "
-                    "FIRST, determine if this is a legal contract or formal agreement. "
-                    "If it is NOT a legal document (e.g., it is a social media post, casual text, or unrelated photo), "
-                    "reply with: '⚠️ This does not appear to be a legal document.' and provide a brief 1-sentence summary of what it actually is. "
-                    "IF it IS a legal document, extract the key terms and clearly flag any high-risk clauses. Keep it concise."
-                )
-            },
+    # Translate back to the user's preferred language if necessary
+    if user_lang != 'en':
+        target_lang = LANGUAGE_MAP.get(user_lang, 'English')
+        print(f"🔄 Translating summary to {target_lang}...")
+        return translate_with_sarvam(clean_english_response, target_lang)
     
-    # 1. Convert the physical image into AI-readable code (Base64)
-    with open(image_path, "rb") as image_file:
-        image_b64 = base64.b64encode(image_file.read()).decode("utf-8")
-        
-    # 2. Call the Vision model (ChatOllama handles multimodal inputs)
-    chat_model = ChatOllama(model="llama3.2-vision")
-    
-    # 3. LangChain message format for multimodal inputs
-    message = HumanMessage(
-        content=[
-            {
-                "type": "text", 
-                "text": "You are an expert legal assistant. Read this image of a contract or document. Extract the key terms and clearly flag any high-risk clauses (like indemnification, extreme liabilities, or strict deadlines). Keep it professional and concise."
-            },
-            {
-                "type": "image_url",
-                "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
-            },
-        ]
-    )
-    
-    print("👁️ Thinking... (Analyzing image with llama3.2-vision)")
-    response = chat_model.invoke([message])
-    return response.content
+    return clean_english_response
 
 if __name__ == "__main__":
     print("\n--- Testing RAG Pipeline ---")

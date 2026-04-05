@@ -1,11 +1,10 @@
 import os
 import asyncio
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
-# Import your working brain, summary, AND vision functions!
+# Import your working brain functions
 from rag_engine import answer_query, summarize_conversation, analyze_contract_image
-
 from dotenv import load_dotenv
 
 # Load the hidden environment variables
@@ -13,15 +12,56 @@ load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fired when the user first starts the bot."""
+    keyboard = [
+        [
+            InlineKeyboardButton("🇬🇧 English", callback_data='lang_en'),
+            InlineKeyboardButton("🇮🇳 हिन्दी (Hindi)", callback_data='lang_hi')
+        ],
+        [
+            InlineKeyboardButton("🇮🇳 मराठी (Marathi)", callback_data='lang_mr'),
+            InlineKeyboardButton("🇮🇳 ગુજરાતી (Gujarati)", callback_data='lang_gu')
+        ],
+        [
+            InlineKeyboardButton("🇮🇳 ಕನ್ನಡ (Kannada)", callback_data='lang_kn'),
+            InlineKeyboardButton("🇮🇳 தமிழ் (Tamil)", callback_data='lang_ta')
+        ],
+        [
+            InlineKeyboardButton("🇮🇳 తెలుగు (Telugu)", callback_data='lang_te')
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
     welcome_msg = (
-        "👋 Welcome to the AVIVO Contract Intelligence Bot!\n\n"
-        "I can help you review and analyze legal documents. Here is what I can do:\n"
-        "🔹 /ask <query> — Ask questions about our stored contracts\n"
-        "🔹 Upload an image — Send a scanned contract for risk tagging\n"
-        "🔹 /summarize — Get an executive summary of our session\n\n"
-        "How can I assist you today?"
+        "👋 Welcome to the AVIVO Contract Intelligence Bot!\n"
+        "Avivo Legal में आपका स्वागत है।\n\n"
+        "Please select your preferred language / कृपया अपनी भाषा चुनें:"
     )
-    await update.message.reply_text(welcome_msg)
+    await update.message.reply_text(welcome_msg, reply_markup=reply_markup)
+
+async def language_selection_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Catches the button click and saves the language."""
+    query = update.callback_query
+    await query.answer() 
+    
+    selected_lang = query.data.split('_')[1] 
+    context.user_data['language'] = selected_lang
+    
+    # Confirm selection and prompt for contract upload/query
+    if selected_lang == 'en':
+        await query.edit_message_text(text="✅ Language set to English.\n\nHere is what I can do:\n🔹 /ask <query> — Ask questions\n🔹 Upload an image — Send a contract for risk tagging\n🔹 /summarize — Get a session summary")
+    elif selected_lang == 'hi':
+        await query.edit_message_text(text="✅ भाषा हिंदी सेट कर दी गई है।\n\nमैं ये कर सकता हूँ:\n🔹 /ask <प्रश्न> — प्रश्न पूछें\n🔹 छवि अपलोड करें — अनुबंध भेजें\n🔹 /summarize — सारांश प्राप्त करें")
+    elif selected_lang == 'mr':
+         await query.edit_message_text(text="✅ भाषा मराठी सेट केली आहे.\n\nमी हे करू शकतो:\n🔹 /ask <प्रश्न> — प्रश्न विचारा\n🔹 प्रतिमा अपलोड करा — करार पाठवा\n🔹 /summarize — सारांश मिळवा")
+    elif selected_lang == 'gu':
+         await query.edit_message_text(text="✅ ભાષા ગુજરાતી સેટ થઈ ગઈ છે.\n\nહું આ કરી શકું છું:\n🔹 /ask <પ્રશ્ન> — પ્રશ્નો પૂછો\n🔹 છબી અપલોડ કરો — કરાર મોકલો\n🔹 /summarize — સારાંશ મેળવો")
+    elif selected_lang == 'kn':
+         await query.edit_message_text(text="✅ ಭಾಷೆಯನ್ನು ಕನ್ನಡಕ್ಕೆ ಹೊಂದಿಸಲಾಗಿದೆ.\n\nನಾನು ಏನು ಮಾಡಬಲ್ಲೆ:\n🔹 /ask <ಪ್ರಶ್ನೆ> — ಪ್ರಶ್ನೆಗಳನ್ನು ಕೇಳಿ\n🔹 ಚಿತ್ರವನ್ನು ಅಪ್‌ಲೋಡ್ ಮಾಡಿ — ಒಪ್ಪಂದವನ್ನು ಕಳುಹಿಸಿ\n🔹 /summarize — ಸಾರಾಂಶವನ್ನು ಪಡೆಯಿರಿ")
+    elif selected_lang == 'ta':
+         await query.edit_message_text(text="✅ மொழி தமிழ் என அமைக்கப்பட்டுள்ளது.\n\nநான் என்ன செய்ய முடியும்:\n🔹 /ask <கேள்வி> — கேள்விகளைக் கேளுங்கள்\n🔹 படத்தை பதிவேற்றவும் — ஒப்பந்தத்தை அனுப்பவும்\n🔹 /summarize — சுருக்கத்தைப் பெறவும்")
+    elif selected_lang == 'te':
+         await query.edit_message_text(text="✅ భాష తెలుగుగా సెట్ చేయబడింది.\n\nనేను ఏమి చేయగలను:\n🔹 /ask <ప్రశ్న> — ప్రశ్నలు అడగండి\n🔹 చిత్రాన్ని అప్‌లోడ్ చేయండి — ఒప్పందాన్ని పంపండి\n🔹 /summarize — సారాంశాన్ని పొందండి")
 
 async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = " ".join(context.args)
@@ -31,46 +71,51 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Please provide a query. Example: /ask What is the liability limit?")
         return
     
-    status_message = await update.message.reply_text(f"🔍 Searching the knowledge base for: '{query}'...\n🧠 Consulting DeepSeek-R1...")
+    # Retrieve the user's preferred language (defaulting to English)
+    user_lang = context.user_data.get('language', 'en')
+    
+    status_message = await update.message.reply_text(f"🔍 Processing query...\n🧠 Consulting AI Engine...")
 
     try:
-        answer = await asyncio.to_thread(answer_query, query, chat_id)
+        # Pass the language tag into the RAG engine so it can translate if needed
+        answer = await asyncio.to_thread(answer_query, query, chat_id, user_lang)
         await status_message.edit_text(answer)
     except Exception as e:
         await status_message.edit_text(f"❌ An error occurred in the AI engine: {str(e)}")
 
 async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    status_message = await update.message.reply_text("📝 Reading our session memory and generating a summary...")
+    
+    # Grab the language preference from memory
+    user_lang = context.user_data.get('language', 'en')
+    
+    status_message = await update.message.reply_text("📝 Processing summary... / सारांश तैयार किया जा रहा है...")
     
     try:
-        summary = await asyncio.to_thread(summarize_conversation, chat_id)
+        # Pass the user_lang into the summarize_conversation function!
+        summary = await asyncio.to_thread(summarize_conversation, chat_id, user_lang)
         await status_message.edit_text(f"**Executive Summary:**\n\n{summary}")
     except Exception as e:
         await status_message.edit_text(f"❌ Error generating summary: {str(e)}")
 
 async def image_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # 1. Send immediate feedback
     status_message = await update.message.reply_text("🖼️ Image received! Downloading...")
     
     try:
-        # 2. Grab the highest resolution version of the photo sent
         photo_file = await update.message.photo[-1].get_file()
         
-        # 3. Create a safe temporary folder if it doesn't exist
         os.makedirs("temp_images", exist_ok=True)
         image_path = os.path.join("temp_images", f"{update.message.message_id}.jpg")
         
-        # Download it to your PC
         await photo_file.download_to_drive(image_path)
-        await status_message.edit_text("👁️ Contract downloaded. Analyzing with Llama-3.2-Vision...\n*(This takes ~15 seconds as it swaps models in your VRAM)*")
+        await status_message.edit_text("👁️ Analyzing document... (Extracting text and translating if needed)")
         
-        # 4. Call the brain!
-        analysis = await asyncio.to_thread(analyze_contract_image, image_path)
+        # Retrieve user language and call the brain!
+        user_lang = context.user_data.get('language', 'en')
+        analysis = await asyncio.to_thread(analyze_contract_image, image_path, user_lang)
         
-        # 5. Clean up the hard drive & send the result
         os.remove(image_path)
-        await status_message.edit_text(f"**🔍 Vision Risk Analysis:**\n\n{analysis}")
+        await status_message.edit_text(f"**🔍 Contract Analysis:**\n\n{analysis}")
         
     except Exception as e:
         await status_message.edit_text(f"❌ Error analyzing image: {str(e)}")
@@ -79,13 +124,12 @@ def main():
     print("Starting AVIVO Contract Bot...")
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Register the command handlers
+    # Register handlers
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", start_command))
     app.add_handler(CommandHandler("ask", ask_command))
     app.add_handler(CommandHandler("summarize", summarize_command))
-    
-    # Register the image handler (triggers on photo uploads)
+    app.add_handler(CallbackQueryHandler(language_selection_handler))
     app.add_handler(MessageHandler(filters.PHOTO, image_handler))
 
     # Start the bot
