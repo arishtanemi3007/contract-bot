@@ -1,15 +1,22 @@
 import os
 import re
 import time
-import sqlite3
-import sqlite_vec
-import struct
+import psycopg2
+from pgvector.psycopg2 import register_vector
+from dotenv import load_dotenv
 import easyocr
 from langdetect import detect
 from sentence_transformers import SentenceTransformer
 from langchain_text_splitters import MarkdownTextSplitter
 from langchain_ollama import OllamaLLM
 from langchain_core.prompts import PromptTemplate
+
+# Load Cloud Secrets
+load_dotenv()
+SUPABASE_URI = os.getenv("SUPABASE_URI")
+
+if not SUPABASE_URI:
+    print("⚠️ WARNING: SUPABASE_URI is missing from your .env file!")
 
 # ---------------------------------------------------------
 # 1. INITIALIZATION & GLOBALS
@@ -25,7 +32,6 @@ sarvam_llm = OllamaLLM(model="mashriram/sarvam-1", temperature=0.1)
 print("Loading EasyOCR Vision Models (English, Hindi, Marathi)...")
 reader = easyocr.Reader(['en', 'hi', 'mr'])
 
-DB_PATH = "contracts.db"
 DATA_DIR = "data"
 
 # --- MEMORY BUFFER ---
@@ -53,44 +59,29 @@ def translate_with_sarvam(text, target_language="English"):
     raw_response = sarvam_llm.invoke(prompt)
     return raw_response.strip()
 
-def init_db():
-    """Initializes the SQLite database with the sqlite-vec extension."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.enable_load_extension(True)
-    sqlite_vec.load(conn)
-    conn.enable_load_extension(False)
-    
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS contract_chunks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            document_name TEXT,
-            chunk_text TEXT
-        )
-    ''')
-    
-    conn.execute('''
-        CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(
-            chunk_embedding float[384]
-        )
-    ''')
-    conn.commit()
-    return conn
-
-def serialize_f32(vector):
-    """Converts a list of floats into the raw bytes required by sqlite-vec."""
-    return struct.pack(f"{len(vector)}f", *vector)
-
 # ---------------------------------------------------------
-# 3. CORE DB OPERATIONS
+# 3. CORE CLOUD DB OPERATIONS (SUPABASE)
 # ---------------------------------------------------------
 def ingest_documents():
-    """Reads Markdown files, chunks them, and stores embeddings in the DB."""
-    conn = init_db()
+    """Reads Markdown files, chunks them, and stores embeddings DIRECTLY IN CLOUD."""
     splitter = MarkdownTextSplitter(chunk_size=500, chunk_overlap=50)
     
     if not os.path.exists(DATA_DIR):
         print(f"Error: Could not find the '{DATA_DIR}' folder.")
         return
+
+    try:
+        conn = psycopg2.connect(SUPABASE_URI)
+        register_vector(conn)
+        cursor = conn.cursor()
+    except Exception as e:
+        print(f"❌ Could not connect to Cloud DB for ingestion: {e}")
+        return
+
+    insert_query = """
+        INSERT INTO contract_chunks (document_name, chunk_text, chunk_embedding)
+        VALUES (%s, %s, %s)
+    """
 
     for filename in os.listdir(DATA_DIR):
         if filename.endswith(".md"):
@@ -98,54 +89,61 @@ def ingest_documents():
             with open(file_path, "r", encoding="utf-8") as f:
                 content = f.read()
             
-            print(f"Processing {filename}...")
+            print(f"Processing {filename} to Cloud...")
             chunks = splitter.create_documents([content])
             
             for chunk in chunks:
                 text = chunk.page_content
                 embedding = embedding_model.encode(text).tolist()
                 
-                cursor = conn.cursor()
-                cursor.execute(
-                    "INSERT INTO contract_chunks (document_name, chunk_text) VALUES (?, ?)",
-                    (filename, text)
-                )
-                row_id = cursor.lastrowid
-                
-                cursor.execute(
-                    "INSERT INTO vec_chunks (rowid, chunk_embedding) VALUES (?, ?)",
-                    (row_id, serialize_f32(embedding))
-                )
+                try:
+                    cursor.execute(insert_query, (filename, text, embedding))
+                except Exception as e:
+                    print(f"⚠️ Error uploading chunk: {e}")
+                    conn.rollback()
+                    continue
             conn.commit()
     
-    print("✅ All documents successfully embedded and stored in contracts.db!")
+    print("✅ All new documents successfully pushed to Supabase!")
+    cursor.close()
     conn.close()
 
 def retrieve_chunks(query, top_k=3):
-    """Embeds the query and fetches the top-k most relevant chunks from the database."""
-    conn = init_db()
+    """Embeds the query and fetches the top-k most relevant chunks from the CLOUD."""
     query_embedding = embedding_model.encode(query).tolist()
     
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT 
-            contract_chunks.document_name, 
-            contract_chunks.chunk_text
-        FROM vec_chunks
-        JOIN contract_chunks ON contract_chunks.id = vec_chunks.rowid
-        WHERE vec_chunks.chunk_embedding MATCH ?
-        AND k = ?
-    ''', (serialize_f32(query_embedding), top_k))
+    # 🚨 FIX: Format the list exactly how Postgres expects a vector string
+    vector_string = f"[{','.join(map(str, query_embedding))}]"
     
-    results = cursor.fetchall()
-    conn.close()
-    return results
+    try:
+        # Connect to Cloud
+        conn = psycopg2.connect(SUPABASE_URI)
+        register_vector(conn)
+        cursor = conn.cursor()
+        
+        # 🚨 FIX: Added ::vector to explicitly cast the string
+        cursor.execute("""
+            SELECT document_name, chunk_text 
+            FROM contract_chunks 
+            ORDER BY chunk_embedding <=> %s::vector 
+            LIMIT %s
+        """, (vector_string, top_k))
+        
+        results = cursor.fetchall()
+        
+        cursor.close()
+        conn.close()
+        return results
+        
+    except Exception as e:
+        print(f"❌ Cloud DB Retrieval Error: {e}")
+        return []
 
 # ---------------------------------------------------------
 # 4. BOT PIPELINE FUNCTIONS
 # ---------------------------------------------------------
 def answer_query(query, chat_id="default", user_lang="en"):
-    """Retrieves context, injects memory, and translates if necessary."""
+    """Retrieves context from Cloud, injects memory, and translates if necessary."""
     
     # 1. Translate incoming Indic query to English for the DeepSeek brain
     if user_lang != 'en':
@@ -155,7 +153,7 @@ def answer_query(query, chat_id="default", user_lang="en"):
         english_query = query
 
     retrieved_docs = retrieve_chunks(english_query)
-    print(f"[DEBUG] Successfully retrieved {len(retrieved_docs)} relevant chunks.")
+    print(f"[DEBUG] Successfully retrieved {len(retrieved_docs)} chunks from CLOUD.")
     
     if not retrieved_docs:
         return "I couldn't find any relevant information in the uploaded contracts."
@@ -268,8 +266,8 @@ def summarize_conversation(chat_id="default", user_lang="en"):
     if not history:
         error_msg = "We haven't discussed anything yet! Use /ask to query your contracts first."
         if user_lang != 'en':
-             target_lang = LANGUAGE_MAP.get(user_lang, 'English')
-             return translate_with_sarvam(error_msg, target_lang)
+            target_lang = LANGUAGE_MAP.get(user_lang, 'English')
+            return translate_with_sarvam(error_msg, target_lang)
         return error_msg
         
     history_string = ""
@@ -296,7 +294,7 @@ def summarize_conversation(chat_id="default", user_lang="en"):
     return clean_english_response
 
 if __name__ == "__main__":
-    print("\n--- Testing RAG Pipeline ---")
+    print("\n--- Testing RAG Pipeline (CLOUD) ---")
     test_question = "What is the liability limit?"
     print(f"Test Question: {test_question}")
     
