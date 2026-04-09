@@ -1,38 +1,34 @@
 import os
 import re
 import time
+import requests
 import psycopg2
 from pgvector.psycopg2 import register_vector
 from dotenv import load_dotenv
-import easyocr
 from langdetect import detect
-from sentence_transformers import SentenceTransformer
 from langchain_text_splitters import MarkdownTextSplitter
-from langchain_ollama import OllamaLLM
+from langchain_groq import ChatGroq
 from langchain_core.prompts import PromptTemplate
 
-# Load Cloud Secrets
+# ---------------------------------------------------------
+# 1. CLOUD SECRETS & INITIALIZATION
+# ---------------------------------------------------------
 load_dotenv()
 SUPABASE_URI = os.getenv("SUPABASE_URI")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+HF_TOKEN = os.getenv("HF_TOKEN")
+OCR_SPACE_API_KEY = os.getenv("OCR_SPACE_API_KEY")
 
-if not SUPABASE_URI:
-    print("⚠️ WARNING: SUPABASE_URI is missing from your .env file!")
+if not all([SUPABASE_URI, GROQ_API_KEY, HF_TOKEN, OCR_SPACE_API_KEY]):
+    print("⚠️ WARNING: One or more Cloud API keys are missing from your .env file!")
 
-# ---------------------------------------------------------
-# 1. INITIALIZATION & GLOBALS
-# ---------------------------------------------------------
-print("Booting local embedding model...")
-embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+print("🔌 Booting Cloud Connections...")
 
-print("Booting local LLMs...")
-deepseek_llm = OllamaLLM(model="deepseek-r1:8b")
-# Initialize Sarvam for Indic translations
-sarvam_llm = OllamaLLM(model="mashriram/sarvam-1", temperature=0.1)
-
-print("Loading EasyOCR Vision Models (English, Hindi, Marathi)...")
-reader = easyocr.Reader(['en', 'hi', 'mr'])
-
-DATA_DIR = "data"
+# Initialize Groq Cloud LLMs (Lightning Fast)
+# deepseek-r1-distill-llama-70b is vastly more powerful than the local 8b model
+deepseek_llm = ChatGroq(api_key=GROQ_API_KEY, model_name="openai/gpt-oss-120b", temperature=0)
+# We use Llama-3.3-70b for fast, highly accurate translations
+translator_llm = ChatGroq(api_key=GROQ_API_KEY, model_name="llama-3.3-70b-versatile", temperature=0.1)
 
 # --- MEMORY BUFFER ---
 chat_histories = {}
@@ -44,10 +40,48 @@ LANGUAGE_MAP = {
 }
 
 # ---------------------------------------------------------
-# 2. HELPER FUNCTIONS
+# 2. CLOUD API HELPER FUNCTIONS
 # ---------------------------------------------------------
-def translate_with_sarvam(text, target_language="English"):
-    """Uses Sarvam-1 for strict, zero-hallucination legal translation."""
+def get_cloud_embedding(text):
+    """Fetches vector embeddings from HuggingFace Cloud API."""
+    api_url = "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2"
+    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+    
+    response = requests.post(api_url, headers=headers, json={"inputs": text, "options": {"wait_for_model": True}})
+    
+    if response.status_code != 200:
+        print(f"⚠️ HF API Error: {response.text}")
+        return [0.0] * 384 # Fallback to empty vector on error
+        
+    res = response.json()
+    # Handle HF returning a list of lists
+    if isinstance(res, list) and len(res) > 0 and isinstance(res[0], list):
+        return res[0]
+    return res
+
+def extract_text_from_image_cloud(image_path):
+    """Sends image to OCR.space for lightweight text extraction."""
+    print("🖼️ Sending image to OCR.space Cloud...")
+    payload = {
+        'isOverlayRequired': False,
+        'apikey': OCR_SPACE_API_KEY,
+        'language': 'eng',
+        'OCREngine': 2 # Engine 2 is highly optimized for document text
+    }
+    with open(image_path, 'rb') as f:
+        response = requests.post('https://api.ocr.space/parse/image', files={image_path: f}, data=payload)
+    
+    result = response.json()
+    if result.get('IsErroredOnProcessing'):
+        print(f"❌ OCR Error: {result.get('ErrorMessage')}")
+        return ""
+        
+    parsed_results = result.get('ParsedResults', [])
+    extracted_text = " ".join([res.get('ParsedText', '') for res in parsed_results])
+    return extracted_text.strip()
+
+def translate_text(text, target_language="English"):
+    """Uses Groq Llama-3 for high-speed legal translation."""
     prompt = f"""You are a highly accurate legal translator.
     Translate the following text into {target_language}.
     Do not summarize, do not add commentary. Just provide the exact translation.
@@ -56,78 +90,71 @@ def translate_with_sarvam(text, target_language="English"):
     {text}
 
     TRANSLATION:"""
-    raw_response = sarvam_llm.invoke(prompt)
-    return raw_response.strip()
+    response = translator_llm.invoke(prompt)
+    return response.content.strip()
 
 # ---------------------------------------------------------
-# 3. CORE CLOUD DB OPERATIONS (SUPABASE)
+# 3. CORE CLOUD DB OPERATIONS (MULTI-TENANT)
 # ---------------------------------------------------------
-def ingest_documents():
-    """Reads Markdown files, chunks them, and stores embeddings DIRECTLY IN CLOUD."""
+def process_and_store_document(text, document_name, telegram_user_id):
+    """Chunks live text from Telegram and stores it in Supabase with the User's ID."""
     splitter = MarkdownTextSplitter(chunk_size=500, chunk_overlap=50)
     
-    if not os.path.exists(DATA_DIR):
-        print(f"Error: Could not find the '{DATA_DIR}' folder.")
-        return
-
     try:
-        conn = psycopg2.connect(SUPABASE_URI)
-        register_vector(conn)
-        cursor = conn.cursor()
-    except Exception as e:
-        print(f"❌ Could not connect to Cloud DB for ingestion: {e}")
-        return
-
-    insert_query = """
-        INSERT INTO contract_chunks (document_name, chunk_text, chunk_embedding)
-        VALUES (%s, %s, %s)
-    """
-
-    for filename in os.listdir(DATA_DIR):
-        if filename.endswith(".md"):
-            file_path = os.path.join(DATA_DIR, filename)
-            with open(file_path, "r", encoding="utf-8") as f:
-                content = f.read()
-            
-            print(f"Processing {filename} to Cloud...")
-            chunks = splitter.create_documents([content])
-            
-            for chunk in chunks:
-                text = chunk.page_content
-                embedding = embedding_model.encode(text).tolist()
-                
-                try:
-                    cursor.execute(insert_query, (filename, text, embedding))
-                except Exception as e:
-                    print(f"⚠️ Error uploading chunk: {e}")
-                    conn.rollback()
-                    continue
-            conn.commit()
-    
-    print("✅ All new documents successfully pushed to Supabase!")
-    cursor.close()
-    conn.close()
-
-def retrieve_chunks(query, top_k=3):
-    """Embeds the query and fetches the top-k most relevant chunks from the CLOUD."""
-    query_embedding = embedding_model.encode(query).tolist()
-    
-    # 🚨 FIX: Format the list exactly how Postgres expects a vector string
-    vector_string = f"[{','.join(map(str, query_embedding))}]"
-    
-    try:
-        # Connect to Cloud
         conn = psycopg2.connect(SUPABASE_URI)
         register_vector(conn)
         cursor = conn.cursor()
         
-        # 🚨 FIX: Added ::vector to explicitly cast the string
+        print(f"📦 Chunking and storing {document_name} for User {telegram_user_id}...")
+        chunks = splitter.create_documents([text])
+        
+        insert_query = """
+            INSERT INTO contract_chunks (document_name, chunk_text, chunk_embedding, telegram_user_id)
+            VALUES (%s, %s, %s, %s)
+        """
+        
+        success_count = 0
+        for chunk in chunks:
+            chunk_text = chunk.page_content
+            # NOW USING CLOUD EMBEDDING
+            embedding = get_cloud_embedding(chunk_text) 
+            
+            try:
+                cursor.execute(insert_query, (document_name, chunk_text, embedding, str(telegram_user_id)))
+                success_count += 1
+            except Exception as e:
+                print(f"⚠️ Error uploading chunk: {e}")
+                conn.rollback()
+                continue
+                
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return f"✅ Successfully securely stored {success_count} chunks from {document_name}."
+        
+    except Exception as e:
+        print(f"❌ Cloud DB Storage Error: {e}")
+        return "❌ Failed to store document securely."
+
+def retrieve_chunks(query, telegram_user_id, top_k=3):
+    """Embeds the query and fetches the top-k most relevant chunks for a SPECIFIC USER."""
+    # NOW USING CLOUD EMBEDDING
+    query_embedding = get_cloud_embedding(query)
+    
+    vector_string = f"[{','.join(map(str, query_embedding))}]"
+    
+    try:
+        conn = psycopg2.connect(SUPABASE_URI)
+        register_vector(conn)
+        cursor = conn.cursor()
+        
         cursor.execute("""
             SELECT document_name, chunk_text 
             FROM contract_chunks 
+            WHERE telegram_user_id = %s
             ORDER BY chunk_embedding <=> %s::vector 
             LIMIT %s
-        """, (vector_string, top_k))
+        """, (str(telegram_user_id), vector_string, top_k))
         
         results = cursor.fetchall()
         
@@ -143,20 +170,19 @@ def retrieve_chunks(query, top_k=3):
 # 4. BOT PIPELINE FUNCTIONS
 # ---------------------------------------------------------
 def answer_query(query, chat_id="default", user_lang="en"):
-    """Retrieves context from Cloud, injects memory, and translates if necessary."""
+    """Retrieves context from Cloud, injects memory, and translates."""
     
-    # 1. Translate incoming Indic query to English for the DeepSeek brain
     if user_lang != 'en':
         print(f"🔄 Translating query from {user_lang} to English...")
-        english_query = translate_with_sarvam(query, "English")
+        english_query = translate_text(query, "English")
     else:
         english_query = query
 
-    retrieved_docs = retrieve_chunks(english_query)
-    print(f"[DEBUG] Successfully retrieved {len(retrieved_docs)} chunks from CLOUD.")
+    retrieved_docs = retrieve_chunks(english_query, chat_id)
+    print(f"[DEBUG] Retrieved {len(retrieved_docs)} chunks from CLOUD for user {chat_id}.")
     
     if not retrieved_docs:
-        return "I couldn't find any relevant information in the uploaded contracts."
+        return "I couldn't find any relevant information in your uploaded contracts."
         
     context_parts = []
     for row in retrieved_docs:
@@ -166,7 +192,6 @@ def answer_query(query, chat_id="default", user_lang="en"):
         
     context_string = "\n".join(context_parts)
     
-    # Format Chat History
     history = chat_histories.get(chat_id, [])
     history_string = ""
     if history:
@@ -189,12 +214,12 @@ def answer_query(query, chat_id="default", user_lang="en"):
     )
     
     prompt = prompt_template.format(chat_history=history_string, context=context_string, query=english_query)
-    print("🧠 Thinking... (Querying deepseek-r1:8b with memory)")
+    print(f"🧠 Thinking... (Querying Groq DeepSeek-70b for user {chat_id})")
     
-    raw_response = deepseek_llm.invoke(prompt)
+    # LangChain ChatGroq returns an AIMessage object, so we extract .content
+    raw_response = deepseek_llm.invoke(prompt).content
     clean_english_response = re.sub(r'<think>.*?</think>', '', raw_response, flags=re.DOTALL).strip()
     
-    # Save English logic to memory to prevent cross-language confusion in future turns
     if chat_id not in chat_histories:
         chat_histories[chat_id] = []
     chat_histories[chat_id].append({"role": "user", "content": english_query})
@@ -203,22 +228,18 @@ def answer_query(query, chat_id="default", user_lang="en"):
     if len(chat_histories[chat_id]) > MAX_HISTORY * 2:
         chat_histories[chat_id] = chat_histories[chat_id][-MAX_HISTORY * 2:]
         
-    # 2. Translate English answer back to the user's selected language
     if user_lang != 'en':
         target_lang = LANGUAGE_MAP.get(user_lang, 'English')
         print(f"🔄 Translating final answer back to {target_lang}...")
-        return translate_with_sarvam(clean_english_response, target_lang)
+        return translate_text(clean_english_response, target_lang)
 
     return clean_english_response
 
 def analyze_contract_image(image_path, user_lang="en"):
-    """Extracts text via OCR, normalizes to English, analyzes, and translates back."""
-    print("🖼️ Running EasyOCR extraction...")
+    """Extracts text via Cloud OCR, normalizes, analyzes, and translates back."""
+    extracted_text = extract_text_from_image_cloud(image_path)
     
-    results = reader.readtext(image_path, detail=0)
-    extracted_text = " ".join(results)
-    
-    if len(extracted_text.strip()) < 10:
+    if len(extracted_text) < 10:
         return "❌ Could not extract enough text from this image. Please ensure the photo is clear and well-lit."
 
     try:
@@ -229,15 +250,13 @@ def analyze_contract_image(image_path, user_lang="en"):
         
     indic_langs = ['hi', 'mr', 'gu', 'kn', 'ta', 'te', 'bn', 'ml', 'or', 'pa']
     
-    # Normalize to English for DeepSeek
     if doc_lang in indic_langs:
-        print("🔄 Translating document to English via Sarvam-1...")
-        english_contract = translate_with_sarvam(extracted_text, "English")
+        print("🔄 Translating document to English via Groq Llama-3...")
+        english_contract = translate_text(extracted_text, "English")
     else:
         english_contract = extracted_text
 
-    # DeepSeek Risk Analysis
-    print("🧠 DeepSeek-R1 analyzing contract liabilities...")
+    print("🧠 Groq DeepSeek-70b analyzing contract liabilities...")
     analysis_prompt = f"""You are an expert AI legal paralegal.
     Review the following contract text extracted from an image.
     Identify any major liabilities, unusual clauses, or risks.
@@ -248,26 +267,25 @@ def analyze_contract_image(image_path, user_lang="en"):
 
     RISK ANALYSIS:"""
     
-    raw_response = deepseek_llm.invoke(analysis_prompt)
+    raw_response = deepseek_llm.invoke(analysis_prompt).content
     clean_english_analysis = re.sub(r'<think>.*?</think>', '', raw_response, flags=re.DOTALL).strip()
 
-    # Translate back to the user's preferred language if necessary
     if user_lang != 'en':
         target_lang = LANGUAGE_MAP.get(user_lang, 'English')
         print(f"🔄 Translating analysis back to {target_lang}...")
-        return translate_with_sarvam(clean_english_analysis, target_lang)
+        return translate_text(clean_english_analysis, target_lang)
 
     return clean_english_analysis
 
 def summarize_conversation(chat_id="default", user_lang="en"):
-    """Reads the user's memory buffer, generates a summary, and translates it."""
+    """Reads memory buffer, generates a summary via Groq, and translates it."""
     history = chat_histories.get(chat_id, [])
     
     if not history:
         error_msg = "We haven't discussed anything yet! Use /ask to query your contracts first."
         if user_lang != 'en':
             target_lang = LANGUAGE_MAP.get(user_lang, 'English')
-            return translate_with_sarvam(error_msg, target_lang)
+            return translate_text(error_msg, target_lang)
         return error_msg
         
     history_string = ""
@@ -281,26 +299,13 @@ def summarize_conversation(chat_id="default", user_lang="en"):
         "Executive Summary:"
     )
     
-    print("📝 Generating Session Summary...")
-    raw_response = deepseek_llm.invoke(prompt)
+    print("📝 Generating Session Summary via Groq...")
+    raw_response = deepseek_llm.invoke(prompt).content
     clean_english_response = re.sub(r'<think>.*?</think>', '', raw_response, flags=re.DOTALL).strip()
     
-    # Translate back to the user's preferred language if necessary
     if user_lang != 'en':
         target_lang = LANGUAGE_MAP.get(user_lang, 'English')
         print(f"🔄 Translating summary to {target_lang}...")
-        return translate_with_sarvam(clean_english_response, target_lang)
+        return translate_text(clean_english_response, target_lang)
     
     return clean_english_response
-
-if __name__ == "__main__":
-    print("\n--- Testing RAG Pipeline (CLOUD) ---")
-    test_question = "What is the liability limit?"
-    print(f"Test Question: {test_question}")
-    
-    start_time = time.time()
-    answer = answer_query(test_question)
-    end_time = time.time()
-    
-    print(f"\n🤖 Final Output:\n{answer}")
-    print(f"\n⏱️ Response Time: {end_time - start_time:.2f} seconds")
