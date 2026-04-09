@@ -44,7 +44,7 @@ LANGUAGE_MAP = {
 # ---------------------------------------------------------
 def get_cloud_embedding(text):
     """Fetches vector embeddings from HuggingFace Cloud API."""
-    api_url = "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2"
+    api_url = "https://router.huggingface.co/hf-inference/models/sentence-transformers/all-MiniLM-L6-v2"
     headers = {"Authorization": f"Bearer {HF_TOKEN}"}
     
     response = requests.post(api_url, headers=headers, json={"inputs": text, "options": {"wait_for_model": True}})
